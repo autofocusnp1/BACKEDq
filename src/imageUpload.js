@@ -1,14 +1,12 @@
-// src/imageUpload.js — uploads a profile picture to freeimage.host and returns its URL.
+// src/imageUpload.js — uploads a profile picture to imgbb and returns its URL.
 //
-// ENV (Render → Environment) — all optional:
-//   FREEIMAGE_API_KEY   your own key from freeimage.host (default: the host's public demo key)
-//   FREEIMAGE_ENDPOINT  defaults to https://freeimage.host/api/1/upload
+// ENV (set on Render):
+//   IMGBB_API_KEY   required — your key from https://api.imgbb.com/
+//   IMGBB_ENDPOINT  optional — defaults to https://api.imgbb.com/1/upload
 //
-// The key stays on the server; the browser only ever sees the final image URL.
+// The key stays on the server; the browser only ever sees the final URL.
 
-const DEFAULT_ENDPOINT = 'https://freeimage.host/api/1/upload';
-const PUBLIC_KEY = '6d207e02198a847aa98d0a2a901485a5';
-const MAX_BASE64_CHARS = 700_000; // ~512 KB — the browser sends a small cropped square, far below this
+const MAX_BASE64_CHARS = 700_000; // ~512 KB of image — the browser sends a small cropped square, far below this
 
 function httpError(status, message) {
   const e = new Error(message);
@@ -36,15 +34,16 @@ function normalizeImage(input) {
 }
 
 export async function uploadAvatar(imageInput, uid) {
-  const key = process.env.FREEIMAGE_API_KEY || PUBLIC_KEY;
-  const endpoint = process.env.FREEIMAGE_ENDPOINT || DEFAULT_ENDPOINT;
+  const key = process.env.IMGBB_API_KEY;
+  if (!key) throw httpError(500, 'Image upload is not configured (IMGBB_API_KEY missing on the server).');
+  const endpoint = process.env.IMGBB_ENDPOINT || 'https://api.imgbb.com/1/upload';
+
   const image = normalizeImage(imageInput);
 
   const body = new URLSearchParams();
   body.set('key', key);
-  body.set('action', 'upload');
-  body.set('source', image);   // base64
-  body.set('format', 'json');
+  body.set('image', image);
+  body.set('name', `avatar_${String(uid).slice(0, 12)}_${Date.now()}`);
 
   let res;
   try {
@@ -52,7 +51,7 @@ export async function uploadAvatar(imageInput, uid) {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: body.toString(),
-      signal: AbortSignal.timeout(25_000),
+      signal: AbortSignal.timeout(20_000),
     });
   } catch (e) {
     throw httpError(504, e?.name === 'TimeoutError' ? 'Image host timed out. Please try again.' : 'Could not reach the image host. Please try again.');
@@ -62,16 +61,15 @@ export async function uploadAvatar(imageInput, uid) {
   let json;
   try { json = JSON.parse(text); } catch { json = null; }
 
-  const ok = res.ok && json && (json.status_code === undefined || json.status_code === 200);
-  if (!ok) {
+  if (!res.ok || !json || json.success === false) {
     const reason = json?.error?.message || json?.status_txt || `HTTP ${res.status}`;
-    console.error('[image-upload] failed for', String(uid).slice(0, 8), '→', res.status, String(reason).slice(0, 200));
+    console.error('[image-upload] upload failed:', res.status, String(reason).slice(0, 200));
     throw httpError(502, 'Image upload failed. Please try a different image or try again later.');
   }
 
-  const url = json?.image?.display_url || json?.image?.url;
+  const url = json?.data?.display_url || json?.data?.url;
   if (!url || !/^https:\/\//i.test(url)) {
-    console.error('[image-upload] no usable URL in response:', text.slice(0, 200));
+    console.error('[image-upload] no usable URL in response');
     throw httpError(502, 'Image host returned an unexpected response.');
   }
   return url;
