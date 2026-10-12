@@ -6,7 +6,7 @@ import { telegramNotify, telegramFormat, esc } from '../src/telegram.js';
 import { getLiveCatalog } from '../src/catalog.js';
 import { STORE_NAME, OWNER_ACCOUNT } from '../src/store.js';
 import { leaderboardCache, announcementCache } from '../src/sharedCaches.js';
-import { uploadAvatar } from '../src/imgbb.js';
+import { uploadAvatar } from '../src/imageUpload.js';
 import { getVersions } from '../src/versions.js';
 import {
   LIMITS_MS, computeLocks, assertUnlocked, RuleError,
