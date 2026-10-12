@@ -1,0 +1,686 @@
+import express from 'express';
+import crypto from 'crypto';
+import { asyncHandler } from '../src/asyncHandler.js';
+import { db, requireAdmin, adminCors } from '../src/firebase.js';
+import { rateLimit } from '../src/security.js';
+import { getMaintenanceOverrides, invalidateMaintenanceCache, getLiveCatalog, invalidateProductCache, findProductFresh, getProductRaw, deleteProduct, invalidateWhatsappProductCache, getWhatsappProductRaw, deleteWhatsappProduct } from '../src/catalog.js';
+import { telegramNotify, telegramFormat } from '../src/telegram.js';
+import { notifyBalanceChange } from '../src/balanceAlerts.js';
+import { OWNER_ACCOUNT } from '../src/store.js';
+import { invalidateUserDoc, invalidateAllUserDocs } from '../src/userCache.js';
+import { announcementCache, policyCache, leaderboardCache } from '../src/sharedCaches.js';
+import { normalizeUrlField, RuleError } from '../src/profileRules.js';
+
+const router = express.Router();
+router.use(adminCors);
+
+router.use(rateLimit({ windowMs: 60_000, max: 90, name: 'admin' }));
+router.use(requireAdmin);
+
+const EMPTY_USER = (uid, email = '') => ({
+  success: true, uid, found: false,
+  balance: 0, email, adminLog: [], purchases: [],
+  topupRequests: [], requestStatus: 'Active', adminMessage: '',
+  profileName: '', profilePhone: '',
+});
+
+
+router.get('/lookup', asyncHandler(async (req, res) => {
+  const uidParam = String(req.query.uid || '').trim();
+  const emailParam = String(req.query.email || '').trim();
+  if (!uidParam && !emailParam) {
+    return res.status(400).json({ success: false, error: 'Provide a uid or email' });
+  }
+
+  let uid = uidParam;
+  let snap;
+
+  if (uid) {
+    snap = await db().collection('users').doc(uid).get();
+  } else {
+    const q = await db().collection('users').where('email', '==', emailParam).limit(1).get();
+    if (q.empty) return res.json(EMPTY_USER('', emailParam));
+    snap = q.docs[0];
+    uid = snap.id;
+  }
+
+  if (!snap.exists) return res.json(EMPTY_USER(uid));
+
+  const data = snap.data();
+  res.json({
+    success: true, uid, found: true,
+    balance: Number(data.balance || 0),
+    email: data.email || '',
+    adminLog: [...(data.adminLog || [])].reverse().slice(0, 50),
+    purchases: [...(data.purchaseHistory || [])].reverse().slice(0, 50),
+    topupRequests: [...(data.topupRequests || [])].reverse().slice(0, 50),
+    requestStatus: data.requestStatus || 'Active',
+    adminMessage: data.adminMessage || '',
+    profileName: data.profileName || '',
+    profilePhone: data.profilePhone || '',
+  });
+}));
+
+
+router.post('/adjust-balance', asyncHandler(async (req, res) => {
+  const uid = String(req.body?.uid || '').trim();
+  const amount = parseInt(req.body?.amount, 10);
+  const direction = String(req.body?.direction || 'add');
+  const note = String(req.body?.note || '').trim();
+
+  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
+  if (!amount || amount <= 0) return res.status(400).json({ success: false, error: 'Enter a valid amount' });
+  if (!['add', 'deduct'].includes(direction)) {
+    return res.status(400).json({ success: false, error: 'direction must be "add" or "deduct"' });
+  }
+
+  const userRef = db().collection('users').doc(uid);
+  try {
+    let beforeBalance = 0;
+    let userEmail = '';
+    const newBalance = await db().runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      const current = snap.exists ? Number(snap.data().balance || 0) : 0;
+      const delta = direction === 'add' ? amount : -amount;
+      const updated = current + delta;
+      if (updated < 0) throw new Error('That would take the balance negative');
+
+      const log = snap.exists ? (snap.data().adminLog || []) : [];
+      log.push({ delta, note, resultingBalance: updated, at: new Date().toISOString() });
+
+      tx.set(userRef, { balance: updated, adminLog: log }, { merge: true });
+      beforeBalance = current;
+      userEmail = snap.exists ? (snap.data().email || '') : '';
+      return updated;
+    });
+    invalidateUserDoc(uid);
+    res.json({ success: true, newBalance });
+
+
+    notifyBalanceChange({
+      actor: 'ADMIN', kind: direction === 'add' ? 'load' : 'deduct',
+      uid, email: userEmail, amount, before: beforeBalance, after: newBalance, note,
+    });
+  } catch (e) {
+    res.status(400).json({ success: false, error: e.message });
+  }
+}));
+
+
+router.post('/set-status', asyncHandler(async (req, res) => {
+  const uid = String(req.body?.uid || '').trim();
+  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
+
+  const allowed = ['Active', 'Pending', 'Rejected', 'Banned'];
+  const update = {};
+
+  if (Object.prototype.hasOwnProperty.call(req.body, 'requestStatus')) {
+    if (!allowed.includes(req.body.requestStatus)) {
+      return res.status(400).json({ success: false, error: `requestStatus must be one of: ${allowed.join(', ')}` });
+    }
+    update.requestStatus = req.body.requestStatus;
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'adminMessage')) {
+    update.adminMessage = String(req.body.adminMessage);
+  }
+  if (Object.keys(update).length === 0) {
+    return res.status(400).json({ success: false, error: 'Nothing to update' });
+  }
+
+  await db().collection('users').doc(uid).set(update, { merge: true });
+  invalidateUserDoc(uid);
+  res.json({ success: true });
+}));
+
+
+router.post('/topup-review', asyncHandler(async (req, res) => {
+  const uid = String(req.body?.uid || '').trim();
+  const txCode = String(req.body?.txCode || '').trim().toUpperCase();
+  const action = String(req.body?.action || '');
+
+  if (!uid || !txCode) return res.status(400).json({ success: false, error: 'Provide uid and txCode' });
+  if (!['approve', 'reject'].includes(action)) {
+    return res.status(400).json({ success: false, error: 'action must be "approve" or "reject"' });
+  }
+
+  const userRef = db().collection('users').doc(uid);
+  let approvedAmount = 0;
+  try {
+    const newBalance = await db().runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) throw new Error('User not found');
+      const data = snap.data();
+      const requests = data.topupRequests || [];
+
+      let found = false;
+      let amount = 0;
+      const updatedRequests = requests.map((r) => {
+        if (!found && r.txCode === txCode && r.status === 'PENDING') {
+          found = true;
+          amount = Number(r.amount || 0);
+          approvedAmount = amount;
+          return { ...r, status: action === 'approve' ? 'APPROVED' : 'REJECTED', reviewedAt: new Date().toISOString() };
+        }
+        return r;
+      });
+
+      if (!found) throw new Error('No matching PENDING request with that transaction code');
+
+      const update = { topupRequests: updatedRequests };
+      let balance = Number(data.balance || 0);
+
+      if (action === 'approve') {
+        balance += amount;
+        const log = data.adminLog || [];
+        log.push({
+          delta: amount, note: `Top-up approved (txCode: ${txCode})`,
+          resultingBalance: balance, at: new Date().toISOString(),
+        });
+        update.balance = balance;
+        update.adminLog = log;
+      }
+
+      tx.set(userRef, update, { merge: true });
+      return balance;
+    });
+    invalidateUserDoc(uid);
+    res.json({ success: true, newBalance });
+    if (action === 'approve') {
+
+      notifyBalanceChange({
+        actor: 'ADMIN', kind: 'load', title: 'TOP-UP APPROVED',
+        uid, amount: approvedAmount, before: newBalance - approvedAmount, after: newBalance,
+        note: `TX code: ${txCode}`,
+      });
+    } else {
+      // Rejections aren't a balance load — left exactly as before.
+      telegramNotify(telegramFormat('Balance Load Rejected', { username: uid, product: OWNER_ACCOUNT, price: 0, uid, status: 'failed', others: `TX code: ${txCode}` }), 'balance');
+    }
+  } catch (e) {
+    res.status(400).json({ success: false, error: e.message });
+  }
+}));
+
+router.post('/backfill-stats', asyncHandler(async (req, res) => {
+  const snap = await db().collection('users').get();
+  let updated = 0;
+  const batchSize = 400;
+  let batch = db().batch();
+  let inBatch = 0;
+
+  for (const doc of snap.docs) {
+    const history = doc.data().purchaseHistory || [];
+    const totalKeysBought = history.length;
+    const totalSpent = history.reduce((sum, h) => sum + (Number(h.price) || 0), 0);
+    batch.set(doc.ref, { totalKeysBought, totalSpent }, { merge: true });
+    inBatch++;
+    updated++;
+    if (inBatch >= batchSize) {
+      await batch.commit();
+      batch = db().batch();
+      inBatch = 0;
+    }
+  }
+  if (inBatch > 0) await batch.commit();
+  invalidateAllUserDocs();
+  leaderboardCache.invalidate();
+
+  res.json({ success: true, usersUpdated: updated });
+}));
+
+
+router.get('/products', asyncHandler(async (req, res) => {
+  const liveCatalog = await getLiveCatalog();
+  const skus = Object.keys(liveCatalog).filter((sku) => liveCatalog[sku].type !== 'whatsapp'); // chat-to-buy products have their own list below
+
+  const products = skus.map((sku) => {
+    const p = liveCatalog[sku];
+    return {
+      sku, pid: p.pid, row: p.row, name: p.name, duration: p.duration, image: p.image,
+      price: p.price,
+      downloadLink: p.downloadLink || '',
+      tags: Array.isArray(p.tags) ? p.tags : [],
+      maintenance: !!p.maintenance,
+      maintenanceMessage: p.maintenance ? (p.maintenanceMessage || 'This product is temporarily under maintenance.') : null,
+      outOfStock: !!p.outOfStock,
+      outOfStockMessage: p.outOfStock ? (p.outOfStockMessage || 'Out of stock — check back soon.') : null,
+    };
+  });
+
+  res.json({ success: true, products });
+}));
+
+
+router.post('/products/:sku/maintenance', asyncHandler(async (req, res) => {
+  const sku = String(req.params.sku || '').trim();
+  const liveCatalog = await getLiveCatalog();
+  if (!liveCatalog[sku]) {
+    return res.status(404).json({ success: false, error: 'Unknown sku' });
+  }
+
+  const maintenance = !!req.body?.maintenance;
+  const message = String(req.body?.message || '').trim();
+  if (message.length > 300) return res.status(400).json({ success: false, error: 'Keep the message under 300 characters' });
+
+  await db().collection('productStatus').doc(sku).set({
+    maintenance,
+    maintenanceMessage: maintenance ? (message || 'This product is temporarily under maintenance.') : null,
+    updatedAt: Date.now(),
+  }, { merge: true });
+
+  invalidateMaintenanceCache();
+  res.json({ success: true, sku, maintenance });
+}));
+
+
+router.post('/products/:sku/out-of-stock', asyncHandler(async (req, res) => {
+  const sku = String(req.params.sku || '').trim();
+  if (!(await findProductFresh(sku))) {
+    return res.status(404).json({ success: false, error: 'Unknown sku' });
+  }
+
+  const outOfStock = !!req.body?.outOfStock;
+  const message = String(req.body?.message || '').trim();
+  if (message.length > 300) return res.status(400).json({ success: false, error: 'Keep the message under 300 characters' });
+
+  await db().collection('productStatus').doc(sku).set({
+    outOfStock,
+    outOfStockMessage: outOfStock ? (message || 'Out of stock — check back soon.') : null,
+    updatedAt: Date.now(),
+  }, { merge: true });
+
+  invalidateMaintenanceCache();
+  res.json({ success: true, sku, outOfStock });
+}));
+
+
+const VALID_TAGS = ['NONROOT', 'ROOT', 'IOS', 'PC'];
+
+function normalizeTags(input) {
+  const arr = Array.isArray(input) ? input : [];
+  return [...new Set(arr.map((t) => String(t || '').trim().toUpperCase()))].filter((t) => VALID_TAGS.includes(t));
+}
+
+
+router.post('/products/create', asyncHandler(async (req, res) => {
+  const image = String(req.body?.image || '').trim();
+  const row = String(req.body?.row || '').trim();
+  const pid = String(req.body?.pid || '').trim();
+  const tags = normalizeTags(req.body?.tags);
+  const durations = Array.isArray(req.body?.durations) ? req.body.durations : [];
+
+  if (!image) return res.status(400).json({ success: false, error: 'Image link is required' });
+  if (!row) return res.status(400).json({ success: false, error: 'Product full name is required' });
+  if (!pid) return res.status(400).json({ success: false, error: 'Pid is required' });
+  if (!tags.length) return res.status(400).json({ success: false, error: `Select at least one tag (${VALID_TAGS.join(', ')})` });
+  if (!durations.length) return res.status(400).json({ success: false, error: 'Add at least one duration + price' });
+  if (durations.length > 20) return res.status(400).json({ success: false, error: 'Too many durations in one go — split it up' });
+
+
+  let downloadLink;
+  try {
+    downloadLink = normalizeUrlField(req.body?.downloadLink, 'Download link', { maxLen: 500 });
+  } catch (e) {
+    if (e instanceof RuleError) return res.status(e.status).json({ success: false, error: e.message });
+    throw e;
+  }
+
+  const batch = db().batch();
+  const created = [];
+
+  for (let i = 0; i < durations.length; i++) {
+    const d = durations[i];
+    const name = String(d?.name || '').trim();
+    const duration = String(d?.duration || '').trim();
+    const price = Number(d?.price);
+    if (!name || !duration) return res.status(400).json({ success: false, error: `Duration #${i + 1}: name and duration label are required` });
+    if (!price || price <= 0) return res.status(400).json({ success: false, error: `Duration #${i + 1}: price must be a positive number` });
+
+    const sku = `p_${pid}_${i + 1}_${Date.now().toString(36)}`;
+    const product = { pid, row, name, duration, price, image, tags, createdAt: Date.now(), ...(downloadLink ? { downloadLink } : {}) };
+    batch.set(db().collection('products').doc(sku), product);
+    created.push({ sku, ...product });
+  }
+
+  await batch.commit();
+  invalidateProductCache();
+  res.json({ success: true, row, products: created });
+}));
+
+
+router.post('/products/:sku/edit', asyncHandler(async (req, res) => {
+  const sku = String(req.params.sku || '').trim();
+  const fields = {};
+  for (const key of ['image', 'name', 'duration', 'pid']) {
+    if (req.body?.[key] !== undefined) {
+      const v = String(req.body[key]).trim();
+      if (!v) return res.status(400).json({ success: false, error: `${key} can't be empty` });
+      fields[key] = v;
+    }
+  }
+  if (req.body?.price !== undefined) {
+    const v = Number(req.body.price);
+    if (!v || v <= 0) return res.status(400).json({ success: false, error: 'Price must be a positive number' });
+    fields.price = v;
+  }
+  if (req.body?.tags !== undefined) {
+    const v = normalizeTags(req.body.tags);
+    if (!v.length) return res.status(400).json({ success: false, error: `Select at least one tag (${VALID_TAGS.join(', ')})` });
+    fields.tags = v;
+  }
+
+  if (req.body?.downloadLink !== undefined) {
+    try {
+      fields.downloadLink = normalizeUrlField(req.body.downloadLink, 'Download link', { maxLen: 500 });
+    } catch (e) {
+      if (e instanceof RuleError) return res.status(e.status).json({ success: false, error: e.message });
+      throw e;
+    }
+  }
+  if (!Object.keys(fields).length) return res.status(400).json({ success: false, error: 'Nothing to update' });
+
+  if (!(await getProductRaw(sku))) return res.status(404).json({ success: false, error: 'Unknown sku' });
+
+  await db().collection('products').doc(sku).set(fields, { merge: true });
+  invalidateProductCache();
+  res.json({ success: true, sku, updated: fields });
+}));
+
+
+router.post('/products/:sku/delete', asyncHandler(async (req, res) => {
+  const sku = String(req.params.sku || '').trim();
+  if (!(await getProductRaw(sku))) return res.status(404).json({ success: false, error: 'Unknown sku' });
+
+  await deleteProduct(sku);
+  await db().collection('productStatus').doc(sku).delete().catch(() => {}); 
+  invalidateMaintenanceCache();
+  res.json({ success: true, sku });
+}));
+
+
+
+router.get('/products/whatsapp', asyncHandler(async (req, res) => {
+  const snap = await db().collection('whatsappProducts').get();
+  const products = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  res.json({ success: true, products });
+}));
+
+
+router.post('/products/create-whatsapp', asyncHandler(async (req, res) => {
+  const image = String(req.body?.image || '').trim();
+  const name = String(req.body?.name || '').trim();
+  const price = Number(req.body?.price);
+  const whatsappMessage = String(req.body?.whatsappMessage || '').trim().slice(0, 400);
+  const viewDetails = String(req.body?.viewDetails || '').trim().slice(0, 1000);
+
+  if (!image) return res.status(400).json({ success: false, error: 'Image link is required' });
+  if (!name) return res.status(400).json({ success: false, error: 'Product name is required' });
+  if (!price || price <= 0) return res.status(400).json({ success: false, error: 'Price must be a positive number' });
+
+  const id = `wa_${Date.now().toString(36)}`;
+  const product = { image, name, price, whatsappMessage, viewDetails, createdAt: Date.now() };
+  await db().collection('whatsappProducts').doc(id).set(product);
+  invalidateWhatsappProductCache();
+  res.json({ success: true, id, ...product });
+}));
+
+
+router.post('/products/whatsapp/:id/edit', asyncHandler(async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const existing = await getWhatsappProductRaw(id);
+  if (!existing) return res.status(404).json({ success: false, error: 'Unknown product' });
+
+  const fields = {};
+  for (const key of ['image', 'name', 'whatsappMessage', 'viewDetails']) {
+    if (req.body?.[key] !== undefined) fields[key] = String(req.body[key]).trim();
+  }
+  if (req.body?.price !== undefined) {
+    const v = Number(req.body.price);
+    if (!v || v <= 0) return res.status(400).json({ success: false, error: 'Price must be a positive number' });
+    fields.price = v;
+  }
+  if (!Object.keys(fields).length) return res.status(400).json({ success: false, error: 'Nothing to update' });
+
+  await db().collection('whatsappProducts').doc(id).set(fields, { merge: true });
+  invalidateWhatsappProductCache();
+  res.json({ success: true, id, updated: fields });
+}));
+
+
+router.post('/products/whatsapp/:id/delete', asyncHandler(async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const existing = await getWhatsappProductRaw(id);
+  if (!existing) return res.status(404).json({ success: false, error: 'Unknown product' });
+  await deleteWhatsappProduct(id);
+  res.json({ success: true, id });
+}));
+
+
+
+function generateRedeemCode() {
+
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const group = (n) => Array.from({ length: n }, () => chars[crypto.randomInt(chars.length)]).join('');
+  const prefix = String(process.env.CODE_PREFIX || 'GIFT').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'GIFT';
+  return `${prefix}_${group(5)}_${group(5)}`;
+}
+
+
+async function createRedeemCodeDoc({ amount, maxUses, expiresAt, code }) {
+  amount = Number(amount);
+  if (!amount || amount <= 0) throw Object.assign(new Error('Amount must be a positive number'), { status: 400 });
+
+  if (maxUses === '' || maxUses === undefined || maxUses === null || String(maxUses).toLowerCase() === 'unlimited') {
+    maxUses = null;
+  } else {
+    maxUses = Number(maxUses);
+    if (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > 100) {
+      throw Object.assign(new Error('Max uses must be a whole number between 1 and 100, or unlimited'), { status: 400 });
+    }
+  }
+
+  let expiresAtMs = null;
+  if (expiresAt && String(expiresAt).toLowerCase() !== 'unlimited') {
+    const t = new Date(expiresAt).getTime();
+    if (Number.isNaN(t)) throw Object.assign(new Error('Invalid expiry date'), { status: 400 });
+    expiresAtMs = t;
+  }
+
+  const finalCode = String(code || '').trim().toUpperCase() || generateRedeemCode();
+  const ref = db().collection('redeemCodes').doc(finalCode);
+  const existing = await ref.get();
+  if (existing.exists) throw Object.assign(new Error('That code already exists'), { status: 409 });
+
+  const docData = {
+    code: finalCode, amount, maxUses, expiresAt: expiresAtMs,
+    active: true, usedCount: 0, redeemedBy: [],
+    createdAt: Date.now(),
+  };
+  await ref.set(docData);
+  return docData;
+}
+
+
+router.post('/redeem-codes', asyncHandler(async (req, res) => {
+  try {
+    const result = await createRedeemCodeDoc(req.body || {});
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(e.status || 400).json({ success: false, error: e.message });
+  }
+}));
+
+
+router.get('/redeem-codes', asyncHandler(async (req, res) => {
+  const snap = await db().collection('redeemCodes').orderBy('createdAt', 'desc').limit(200).get();
+  const codes = snap.docs.map((d) => d.data());
+  res.json({ success: true, codes });
+}));
+
+
+router.post('/redeem-codes/:code/deactivate', asyncHandler(async (req, res) => {
+  const code = String(req.params.code || '').trim().toUpperCase();
+  const ref = db().collection('redeemCodes').doc(code);
+  const snap = await ref.get();
+  if (!snap.exists) return res.status(404).json({ success: false, error: 'Code not found' });
+  await ref.set({ active: false }, { merge: true });
+  res.json({ success: true });
+}));
+
+
+router.get('/stats', asyncHandler(async (req, res) => {
+  const snap = await db().collection('users').get();
+  let totalRevenue = 0, totalKeysSold = 0;
+  snap.forEach((d) => {
+    const data = d.data();
+    totalRevenue += Number(data.totalSpent || 0);
+    totalKeysSold += Number(data.totalKeysBought || 0);
+  });
+  res.json({ success: true, totalUsers: snap.size, totalRevenue, totalKeysSold });
+}));
+
+
+router.get('/rankings', asyncHandler(async (req, res) => {
+  const snap = await db().collection('users').orderBy('totalSpent', 'desc').limit(100).get();
+  const rankings = snap.docs.map((d) => {
+    const data = d.data();
+    return {
+      uid: d.id,
+      email: data.email || '',
+      profileName: data.profileName || '',
+      balance: Number(data.balance || 0),
+      totalSpent: Number(data.totalSpent || 0),
+      totalKeysBought: Number(data.totalKeysBought || 0),
+    };
+  });
+  res.json({ success: true, rankings });
+}));
+
+
+router.post('/announcements', asyncHandler(async (req, res) => {
+  const message = String(req.body?.message || '').trim();
+  if (!message) return res.status(400).json({ success: false, error: 'Write a message first' });
+  if (message.length > 500) return res.status(400).json({ success: false, error: 'Keep the message under 500 characters' });
+
+  let gift = null;
+  const giftAmount = req.body?.giftAmount;
+  if (giftAmount !== undefined && giftAmount !== null && giftAmount !== '') {
+    try {
+      gift = await createRedeemCodeDoc({
+        amount: giftAmount,
+        maxUses: req.body?.giftMaxUses ?? null,
+        expiresAt: req.body?.giftExpiresAt ?? null,
+      });
+    } catch (e) {
+      return res.status(e.status || 400).json({ success: false, error: `Gift code: ${e.message}` });
+    }
+  }
+
+  const id = `ann_${Date.now()}`;
+  const docData = {
+    id, message,
+    giftCode: gift?.code || null,
+    giftAmount: gift?.amount || null,
+    active: true,
+    createdAt: Date.now(),
+  };
+
+
+  const prevActive = await db().collection('announcements').where('active', '==', true).limit(20).get();
+  if (!prevActive.empty) {
+    const batch = db().batch();
+    prevActive.docs.forEach((d) => batch.set(d.ref, { active: false }, { merge: true }));
+    await batch.commit();
+  }
+
+  await db().collection('announcements').doc(id).set(docData);
+  announcementCache.invalidate();
+  res.json({ success: true, announcement: docData });
+}));
+
+
+router.get('/announcements', asyncHandler(async (req, res) => {
+  const snap = await db().collection('announcements').orderBy('createdAt', 'desc').limit(50).get();
+  res.json({ success: true, announcements: snap.docs.map((d) => d.data()) });
+}));
+
+
+router.post('/announcements/:id/deactivate', asyncHandler(async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const ref = db().collection('announcements').doc(id);
+  const snap = await ref.get();
+  if (!snap.exists) return res.status(404).json({ success: false, error: 'Announcement not found' });
+  await ref.set({ active: false }, { merge: true });
+  announcementCache.invalidate();
+  res.json({ success: true });
+}));
+
+
+router.get('/users', asyncHandler(async (req, res) => {
+  const topupDays = req.query.topupDays ? parseInt(req.query.topupDays, 10) : null;
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 200));
+
+  const cutoff = topupDays ? Date.now() - topupDays * 24 * 60 * 60 * 1000 : null;
+
+  const snap = await db().collection('users').get();
+  const rows = [];
+
+  snap.forEach((doc) => {
+    const d = doc.data();
+    const topups = Array.isArray(d.topupRequests) ? d.topupRequests : [];
+
+
+    const approved = topups.filter((t) => t.status === 'APPROVED');
+    const lastTopup = approved.length
+      ? approved.reduce((latest, t) => (new Date(t.date) > new Date(latest.date) ? t : latest))
+      : null;
+    const lastTopupAt = lastTopup ? new Date(lastTopup.date).getTime() : null;
+
+    if (cutoff !== null && (!lastTopupAt || lastTopupAt < cutoff)) return;
+
+    const row = {
+      uid: doc.id,
+      name: d.profileName || (d.email ? d.email.split('@')[0] : 'Unknown'),
+      whatsapp: d.profilePhone || '',
+      email: d.email || '',
+      balance: Number(d.balance || 0),
+      totalKeysBought: Number(d.totalKeysBought || 0),
+      totalSpent: Number(d.totalSpent || 0),
+      lastTopupAt,
+      lastTopupAmount: lastTopup ? Number(lastTopup.amount || 0) : null,
+    };
+
+    if (q) {
+      const hay = `${row.name} ${row.email} ${row.whatsapp} ${row.uid}`.toLowerCase();
+      if (!hay.includes(q)) return;
+    }
+
+    rows.push(row);
+  });
+
+  
+  rows.sort((a, b) => (topupDays ? (b.lastTopupAt || 0) - (a.lastTopupAt || 0) : b.totalSpent - a.totalSpent));
+
+  res.json({ success: true, total: rows.length, users: rows.slice(0, limit) });
+}));
+
+
+router.get('/policy', asyncHandler(async (req, res) => {
+  const p = await policyCache.get(); // writes the default policy automatically if the doc is missing
+  res.json({ success: true, title: p.title || '', body: p.body || '', updatedAt: p.updatedAt || null });
+}));
+
+router.post('/policy', asyncHandler(async (req, res) => {
+  const title = String(req.body?.title || '').trim();
+  const body = String(req.body?.body || '').trim();
+  if (!title) return res.status(400).json({ success: false, error: 'Title is required' });
+  if (!body) return res.status(400).json({ success: false, error: 'Policy text is required' });
+  if (body.length > 20000) return res.status(400).json({ success: false, error: 'Policy text is too long (max 20,000 characters)' });
+
+  await db().collection('config').doc('policy').set({ title, body, updatedAt: Date.now() }, { merge: true });
+  policyCache.invalidate();
+  res.json({ success: true });
+}));
+
+export default router;
